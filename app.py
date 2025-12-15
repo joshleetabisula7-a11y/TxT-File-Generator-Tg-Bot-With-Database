@@ -19,7 +19,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7011151235"))
 
 LOG_FILE = "logs.txt"
-SEARCH_LINE_LIMIT = 200  # <-- per-search limit
+SEARCH_LINE_LIMIT = 200  # exact lines to send per search
 SEARCH_COOLDOWN_MINUTES = 5  # per-user cooldown in minutes
 
 if not TOKEN or not DATABASE_URL:
@@ -53,7 +53,8 @@ def load_logs():
     if not os.path.exists(LOG_FILE):
         open(LOG_FILE, "w").close()
     with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
-        return [line.strip() for line in f if line.strip()]
+        # keep original lines (rstrip newline)
+        return [line.rstrip("\n") for line in f if line.strip()]
 
 logs = load_logs()
 sent = {}  # mapping: keyword -> set(lines already sent for this kw)
@@ -231,8 +232,7 @@ def start(message):
         f"{status_line}\n\n"
         "Welcome to <b>PaFreeTxtNiJosh</b> — search large logs quickly and safely.\n"
         "Use the buttons below to start searching, redeem a key, or see help.\n\n"
-        f"<i>Tip:</i> If results are too long we send only the first {SEARCH_LINE_LIMIT} lines per search.\n"
-        f"<i>Anti-spam:</i> There is a {SEARCH_COOLDOWN_MINUTES}-minute cooldown between searches per user."
+        f"<i>Tip:</i> You get up to {SEARCH_LINE_LIMIT} lines per search, and a {SEARCH_COOLDOWN_MINUTES}-minute cooldown between searches."
     )
 
     bot.send_message(message.chat.id, welcome, parse_mode="HTML", reply_markup=make_main_keyboard(is_admin=is_admin))
@@ -267,7 +267,7 @@ def do_search(message):
             bot.send_message(message.chat.id, "❌ You need an active key to search.")
             return
 
-        # cooldown check again (in-case time passed between pressing button and sending message)
+        # cooldown check again
         on_cd, rem = is_on_cooldown(uid)
         if on_cd:
             bot.send_message(message.chat.id, f"⏳ Cooldown active. Please wait {fmt_timedelta(rem)} before your next search.")
@@ -278,31 +278,41 @@ def do_search(message):
             bot.send_message(message.chat.id, "❌ Empty keyword.")
             return
 
+        # mark last search timestamp immediately (prevents spam attempts)
+        set_search_timestamp(uid)
+
+        # collect up to SEARCH_LINE_LIMIT + 1 to detect "more exist" without scanning whole file
         results = []
         seen = sent.get(kw, set())
+        found_count = 0
+        more_exists = False
+
         for line in logs:
             if kw in line.lower() and line not in seen:
-                results.append(line)
-                # optional safety cap (very large)
-                if len(results) >= 10000:
+                found_count += 1
+                if len(results) < SEARCH_LINE_LIMIT + 1:
+                    results.append(line)
+                if found_count > SEARCH_LINE_LIMIT:
+                    # found more than limit — stop scanning
+                    more_exists = True
                     break
 
         if not results:
             bot.send_message(message.chat.id, "❌ No results found.")
             return
 
-        # update sent-tracking and apply per-search line limit
-        sent.setdefault(kw, set()).update(results)
-        truncated = False
+        # results list contains up to SEARCH_LINE_LIMIT+1; pick exactly SEARCH_LINE_LIMIT to send
         if len(results) > SEARCH_LINE_LIMIT:
-            truncated = True
             results_to_send = results[:SEARCH_LINE_LIMIT]
+            more_exists = True
         else:
             results_to_send = results
+            more_exists = False
 
-        # mark last search timestamp (start of sending)
-        set_search_timestamp(uid)
+        # update sent-tracking ONLY with the lines that were actually sent
+        sent.setdefault(kw, set()).update(results_to_send)
 
+        # write out file with only the results_to_send
         tmp_path = None
         try:
             tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, prefix="results_", suffix=".txt")
@@ -310,9 +320,12 @@ def do_search(message):
             tmp.write("\n".join(results_to_send))
             tmp.close()
 
-            caption = f"✅ Found {len(results)} lines"
-            if truncated:
-                caption += f" — showing first {SEARCH_LINE_LIMIT} lines"
+            caption = f"✅ Showing {len(results_to_send)} lines"
+            if more_exists:
+                caption += f" — there are more matching lines (showing first {SEARCH_LINE_LIMIT})."
+            else:
+                caption += " — end of matches."
+
             caption += f"\n⏱️ Next search available in {SEARCH_COOLDOWN_MINUTES} minutes."
             with open(tmp_path, "rb") as f:
                 bot.send_document(
@@ -326,6 +339,7 @@ def do_search(message):
                     os.remove(tmp_path)
                 except Exception:
                     pass
+
     except Exception as e:
         bot.send_message(message.chat.id, "⚠️ Error during search.")
         try:
@@ -530,7 +544,11 @@ def admin_panel(call):
 
 @bot.callback_query_handler(func=lambda c: c.data == "admin_back")
 def admin_back(call):
-    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=make_main_keyboard(is_admin=True))
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=make_main_keyboard(is_admin=True))
+    except Exception:
+        # fallback: just resend main menu
+        bot.send_message(call.message.chat.id, "Admin menu closed.", reply_markup=make_main_keyboard(is_admin=True))
 
 @bot.callback_query_handler(func=lambda c: c.data == "admin_createkeys")
 def admin_createkeys(call):
