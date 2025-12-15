@@ -6,6 +6,8 @@ import tempfile
 import hashlib
 import uuid
 import html
+import time
+import sys
 from datetime import datetime, timedelta
 
 import psycopg2
@@ -19,7 +21,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7011151235"))
 
 LOG_FILE = "logs.txt"
-SEARCH_LINE_LIMIT = 200  # exact lines to send per search
+SEARCH_LINE_LIMIT = 200  # exact lines to send per page
 SEARCH_COOLDOWN_MINUTES = 5  # per-user cooldown in minutes
 
 if not TOKEN or not DATABASE_URL:
@@ -53,11 +55,13 @@ def load_logs():
     if not os.path.exists(LOG_FILE):
         open(LOG_FILE, "w").close()
     with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
-        # keep original lines (rstrip newline)
         return [line.rstrip("\n") for line in f if line.strip()]
 
 logs = load_logs()
-sent = {}  # mapping: keyword -> set(lines already sent for this kw)
+
+# ================= SESSION STORAGE (in-memory) =================
+# user_sessions: user_id -> { keyword -> { 'last_scanned_pos': int, 'delivered': int, 'finished': bool } }
+user_sessions = {}
 
 # ================= COOLDOWN (in-memory) =================
 # mapping: user_id -> datetime of last search
@@ -194,9 +198,11 @@ def refresh_logs_cmd(message):
     if message.from_user.id != ADMIN_ID:
         bot.reply_to(message, "❌ Not authorized")
         return
-    global logs
+    global logs, user_sessions
     logs = load_logs()
-    bot.reply_to(message, f"✅ Logs reloaded. {len(logs)} lines loaded.")
+    # reset sessions because log positions changed
+    user_sessions.clear()
+    bot.reply_to(message, f"✅ Logs reloaded. {len(logs)} lines loaded and sessions cleared.")
 
 # ================= START / WELCOME =================
 def make_main_keyboard(is_admin=False):
@@ -232,20 +238,35 @@ def start(message):
         f"{status_line}\n\n"
         "Welcome to <b>PaFreeTxtNiJosh</b> — search large logs quickly and safely.\n"
         "Use the buttons below to start searching, redeem a key, or see help.\n\n"
-        f"<i>Tip:</i> You get up to {SEARCH_LINE_LIMIT} lines per search, and a {SEARCH_COOLDOWN_MINUTES}-minute cooldown between searches."
+        f"<i>Tip:</i> You get up to {SEARCH_LINE_LIMIT} lines per page, and a {SEARCH_COOLDOWN_MINUTES}-minute cooldown between searches."
     )
 
     bot.send_message(message.chat.id, welcome, parse_mode="HTML", reply_markup=make_main_keyboard(is_admin=is_admin))
 
-# ================= SEARCH FLOW =================
+# ================= SEARCH HELPERS & FLOW =================
+def start_or_resume_session(user_id, kw):
+    """Ensure a session exists for user+kw and return it."""
+    us = user_sessions.setdefault(user_id, {})
+    sess = us.get(kw)
+    if sess is None:
+        sess = {"last_scanned_pos": -1, "delivered": 0, "finished": False}
+        us[kw] = sess
+    return sess
+
+def clear_user_session(user_id, kw=None):
+    """Clear a single keyword session or all for a user."""
+    if user_id in user_sessions:
+        if kw:
+            user_sessions[user_id].pop(kw, None)
+        else:
+            user_sessions.pop(user_id, None)
+
 @bot.callback_query_handler(func=lambda c: c.data == "search")
 def ask_search(call):
-    # check active key
     if not has_active_key(call.from_user.id):
         bot.answer_callback_query(call.id, "You need an active key to search (use Redeem).", show_alert=True)
         return
 
-    # cooldown check
     on_cd, rem = is_on_cooldown(call.from_user.id)
     if on_cd:
         bot.answer_callback_query(call.id, f"Please wait {fmt_timedelta(rem)} before your next search.", show_alert=True)
@@ -254,20 +275,112 @@ def ask_search(call):
     msg = bot.send_message(call.message.chat.id, "🔎 Please send the keyword to search for:")
     bot.register_next_step_handler(msg, do_search)
 
-def safe_filename_for_kw(kw):
-    h = hashlib.sha1(kw.encode("utf-8")).hexdigest()[:16]
-    return f"results_{h}.txt"
+def scan_next_page_for_session(user_id, kw):
+    """
+    Scan logs starting from session['last_scanned_pos']+1, collect up to SEARCH_LINE_LIMIT matches,
+    update session['last_scanned_pos'] to the index of the last scanned line,
+    and set session['finished'] True if end reached.
+    Returns (results_list, more_exists_bool).
+    """
+    sess = start_or_resume_session(user_id, kw)
+    results = []
+    more_exists = False
+    last_pos = sess["last_scanned_pos"]
+    start_index = last_pos + 1
+    # scan from start_index
+    n = len(logs)
+    scanned_pos = last_pos
+    matches = 0
+    for idx in range(start_index, n):
+        scanned_pos = idx
+        line = logs[idx]
+        if kw in line.lower():
+            matches += 1
+            if len(results) < SEARCH_LINE_LIMIT:
+                results.append(line)
+            # if we already collected SEARCH_LINE_LIMIT matches, continue scanning one more match to know if there are more
+            if matches > SEARCH_LINE_LIMIT:
+                more_exists = True
+                break
+    # update session
+    sess["last_scanned_pos"] = scanned_pos
+    # if scanned to end, mark finished
+    if scanned_pos >= n - 1:
+        sess["finished"] = True
+    # if we didn't find any matches at all and finished scanning, leave results empty and finished True
+    return results, more_exists
+
+def make_more_keyboard(kw, finished=False):
+    kb = InlineKeyboardMarkup()
+    if not finished:
+        kb.add(InlineKeyboardButton("▶️ More", callback_data=f"more:{kw}"))
+    kb.add(InlineKeyboardButton("🏠 Menu", callback_data="menu"))
+    return kb
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("more:"))
+def more_cb(call):
+    # callback to fetch next page for the keyword
+    kw = call.data.split(":",1)[1]
+    uid = call.from_user.id
+
+    if not has_active_key(uid):
+        bot.answer_callback_query(call.id, "You need an active key to search (use Redeem).", show_alert=True)
+        return
+
+    on_cd, rem = is_on_cooldown(uid)
+    if on_cd:
+        bot.answer_callback_query(call.id, f"Please wait {fmt_timedelta(rem)} before your next search.", show_alert=True)
+        return
+
+    results, more_exists = scan_next_page_for_session(uid, kw)
+    if not results:
+        # no results this page -> either finished or nothing left
+        bot.answer_callback_query(call.id, "No more results found for this keyword.", show_alert=True)
+        return
+
+    # mark timestamp (user used a page)
+    set_search_timestamp(uid)
+
+    # write file
+    tmp_path = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, prefix="results_", suffix=".txt")
+        tmp_path = tmp.name
+        tmp.write("\n".join(results))
+        tmp.close()
+
+        caption = f"✅ Showing {len(results)} lines (next page)"
+        if more_exists:
+            caption += f" — there are more matching lines."
+        else:
+            caption += " — end of matches."
+        caption += f"\n⏱️ Next search available in {SEARCH_COOLDOWN_MINUTES} minutes."
+
+        with open(tmp_path, "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption=caption, reply_markup=make_more_keyboard(kw, finished=not more_exists))
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+@bot.callback_query_handler(func=lambda c: c.data == "menu")
+def menu_cb(call):
+    is_admin = (call.from_user.id == ADMIN_ID)
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=make_main_keyboard(is_admin=is_admin))
+    except Exception:
+        bot.send_message(call.message.chat.id, "Menu:", reply_markup=make_main_keyboard(is_admin=is_admin))
 
 def do_search(message):
     try:
         uid = message.from_user.id
 
-        # check active key before performing search
         if not has_active_key(uid):
             bot.send_message(message.chat.id, "❌ You need an active key to search.")
             return
 
-        # cooldown check again
         on_cd, rem = is_on_cooldown(uid)
         if on_cd:
             bot.send_message(message.chat.id, f"⏳ Cooldown active. Please wait {fmt_timedelta(rem)} before your next search.")
@@ -278,61 +391,40 @@ def do_search(message):
             bot.send_message(message.chat.id, "❌ Empty keyword.")
             return
 
-        # mark last search timestamp immediately (prevents spam attempts)
+        # starting fresh search: create/clear session for this user+kw
+        # (we keep other keyword sessions intact)
+        start_or_resume_session(uid, kw)
+        # mark timestamp immediately to enforce cooldown
         set_search_timestamp(uid)
 
-        # collect up to SEARCH_LINE_LIMIT + 1 to detect "more exist" without scanning whole file
-        results = []
-        seen = sent.get(kw, set())
-        found_count = 0
-        more_exists = False
-
-        for line in logs:
-            if kw in line.lower() and line not in seen:
-                found_count += 1
-                if len(results) < SEARCH_LINE_LIMIT + 1:
-                    results.append(line)
-                if found_count > SEARCH_LINE_LIMIT:
-                    # found more than limit — stop scanning
-                    more_exists = True
-                    break
+        # scan next page
+        results, more_exists = scan_next_page_for_session(uid, kw)
 
         if not results:
-            bot.send_message(message.chat.id, "❌ No results found.")
+            # nothing found for this user (either no matches or all matches already consumed)
+            # If session finished and no results, tell user
+            bot.send_message(message.chat.id, "❌ No results found for that keyword (or you've already fetched them).")
             return
 
-        # results list contains up to SEARCH_LINE_LIMIT+1; pick exactly SEARCH_LINE_LIMIT to send
-        if len(results) > SEARCH_LINE_LIMIT:
-            results_to_send = results[:SEARCH_LINE_LIMIT]
-            more_exists = True
-        else:
-            results_to_send = results
-            more_exists = False
-
-        # update sent-tracking ONLY with the lines that were actually sent
-        sent.setdefault(kw, set()).update(results_to_send)
-
-        # write out file with only the results_to_send
+        # write file
         tmp_path = None
         try:
             tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, prefix="results_", suffix=".txt")
             tmp_path = tmp.name
-            tmp.write("\n".join(results_to_send))
+            tmp.write("\n".join(results))
             tmp.close()
 
-            caption = f"✅ Showing {len(results_to_send)} lines"
+            caption = f"✅ Showing {len(results)} lines"
             if more_exists:
-                caption += f" — there are more matching lines (showing first {SEARCH_LINE_LIMIT})."
+                caption += f" — there are more matching lines (use More ▶️)."
             else:
                 caption += " — end of matches."
-
             caption += f"\n⏱️ Next search available in {SEARCH_COOLDOWN_MINUTES} minutes."
+
+            # include More button if there are more
+            kb = make_more_keyboard(kw, finished=not more_exists)
             with open(tmp_path, "rb") as f:
-                bot.send_document(
-                    message.chat.id,
-                    f,
-                    caption=caption
-                )
+                bot.send_document(message.chat.id, f, caption=caption, reply_markup=kb)
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 try:
@@ -354,23 +446,17 @@ def feedback_prompt(call):
     bot.register_next_step_handler(msg, feedback_receive_photo)
 
 def feedback_receive_photo(message):
-    """
-    Expecting a photo message (with optional caption).
-    We'll forward the photo+caption to admin with approve/reject buttons.
-    """
     try:
         if not message.photo:
             bot.send_message(message.chat.id, "❌ No photo detected. Please press Feedback again and send a photo.")
             return
 
-        # take the highest-resolution photo (last in list)
         file_id = message.photo[-1].file_id
         caption = message.caption or ""
         uid = message.from_user.id
         name = message.from_user.first_name or ""
         username = ("@" + message.from_user.username) if message.from_user.username else "NoUsername"
 
-        # create feedback entry
         fid = uuid.uuid4().hex[:10]
         feedbacks[fid] = {
             "user_id": uid,
@@ -383,7 +469,6 @@ def feedback_receive_photo(message):
             "admin_msg_id": None
         }
 
-        # send to admin with approve/reject buttons
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(
             InlineKeyboardButton("✅ Approve", callback_data=f"fb_approve:{fid}"),
@@ -397,10 +482,8 @@ def feedback_receive_photo(message):
             f"Sent: {feedbacks[fid]['created_at']}"
         )
 
-        # send photo to admin; capture returned message id and chat id
         sent_msg = bot.send_photo(ADMIN_ID, file_id, caption=admin_caption, parse_mode="HTML", reply_markup=kb)
 
-        # store admin message reference
         feedbacks[fid]["admin_msg_chat"] = sent_msg.chat.id
         feedbacks[fid]["admin_msg_id"] = sent_msg.message_id
 
@@ -432,19 +515,16 @@ def feedback_approve_cb(call):
         fb["admin_decision_at"] = datetime.now()
         fb["admin_decision_by"] = call.from_user.id
 
-        # edit admin message caption to show approved status
         try:
             new_caption = f"{call.message.caption}\n\n✅ <b>APPROVED</b> by admin ({call.from_user.id}) at {fb['admin_decision_at']}"
             bot.edit_message_caption(chat_id=fb["admin_msg_chat"], message_id=fb["admin_msg_id"], caption=new_caption, parse_mode="HTML", reply_markup=None)
         except Exception:
-            # fallback: edit reply markup only
             try:
                 bot.edit_message_reply_markup(chat_id=fb["admin_msg_chat"], message_id=fb["admin_msg_id"], reply_markup=None)
                 bot.send_message(ADMIN_ID, f"✅ Feedback {fid} approved.")
             except Exception:
                 pass
 
-        # notify the original user
         try:
             bot.send_message(fb["user_id"], f"✅ Your feedback (ID: {fid}) was approved by admin. Thank you!")
         except Exception:
@@ -477,19 +557,16 @@ def feedback_reject_cb(call):
         fb["admin_decision_at"] = datetime.now()
         fb["admin_decision_by"] = call.from_user.id
 
-        # edit admin message caption to show rejected status
         try:
             new_caption = f"{call.message.caption}\n\n❌ <b>REJECTED</b> by admin ({call.from_user.id}) at {fb['admin_decision_at']}"
             bot.edit_message_caption(chat_id=fb["admin_msg_chat"], message_id=fb["admin_msg_id"], caption=new_caption, parse_mode="HTML", reply_markup=None)
         except Exception:
-            # fallback: edit reply markup only
             try:
                 bot.edit_message_reply_markup(chat_id=fb["admin_msg_chat"], message_id=fb["admin_msg_id"], reply_markup=None)
                 bot.send_message(ADMIN_ID, f"❌ Feedback {fid} rejected.")
             except Exception:
                 pass
 
-        # notify the original user
         try:
             bot.send_message(fb["user_id"], f"❌ Your feedback (ID: {fid}) was rejected by admin.")
         except Exception:
@@ -503,7 +580,7 @@ def feedback_reject_cb(call):
         except Exception:
             pass
 
-# ================= CHECK ACCESS CALLBACK =================
+# ================= CHECK ACCESS, HELP, REFRESH CALLBACKS (admin) =================
 @bot.callback_query_handler(func=lambda c: c.data == "check_access")
 def check_access(call):
     expiry = get_user_expiry(call.from_user.id)
@@ -512,20 +589,19 @@ def check_access(call):
     else:
         bot.answer_callback_query(call.id, "❌ No active key", show_alert=True)
 
-# ================= HELP CALLBACK =================
 @bot.callback_query_handler(func=lambda c: c.data == "help_cb")
 def help_callback(call):
     help_cmd(call.message)
 
-# ================= REFRESH LOGS CALLBACK (admin only) =================
 @bot.callback_query_handler(func=lambda c: c.data == "refresh_logs")
 def refresh_logs_cb(call):
     if call.from_user.id != ADMIN_ID:
         bot.answer_callback_query(call.id, "Not authorized", show_alert=True)
         return
-    global logs
+    global logs, user_sessions
     logs = load_logs()
-    bot.answer_callback_query(call.id, f"✅ Logs reloaded ({len(logs)} lines).", show_alert=True)
+    user_sessions.clear()
+    bot.answer_callback_query(call.id, f"✅ Logs reloaded ({len(logs)} lines) and sessions cleared.", show_alert=True)
 
 # ================= ADMIN PANEL =================
 @bot.callback_query_handler(func=lambda c: c.data == "admin_panel")
@@ -547,7 +623,6 @@ def admin_back(call):
     try:
         bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=make_main_keyboard(is_admin=True))
     except Exception:
-        # fallback: just resend main menu
         bot.send_message(call.message.chat.id, "Admin menu closed.", reply_markup=make_main_keyboard(is_admin=True))
 
 @bot.callback_query_handler(func=lambda c: c.data == "admin_createkeys")
@@ -592,7 +667,6 @@ def admin_listusers(call):
         bot.send_message(call.message.chat.id, "No users with active access.")
         return
     lines = [f"{r[0]} — {r[1]}" for r in rows]
-    # send as file if too long
     tmp_path = None
     try:
         tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, prefix="users_", suffix=".txt")
@@ -648,7 +722,52 @@ def run_web():
 
 # ================= RUN =================
 if __name__ == "__main__":
+    # start the web server thread first
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
-    print("🤖 Bot running (polling) — web health listener started")
-    bot.polling(none_stop=True)
+    print("Web health endpoint started.")
+
+    # remove any existing webhook so getUpdates (polling) works reliably
+    try:
+        print("Removing webhook (if present)...")
+        bot.remove_webhook()
+        print("Webhook removed or none set.")
+    except Exception as e:
+        print(f"Warning: remove_webhook() failed: {e}")
+
+    # resilient polling loop
+    retry_delay = 2
+    max_delay = 60
+    print("Starting polling loop...")
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=20)
+        except telebot.apihelper.ApiTelegramException as api_exc:
+            msg = f"ApiTelegramException during polling: {api_exc}"
+            print(msg, file=sys.stderr)
+            if "Unauthorized" in str(api_exc) or "401" in str(api_exc):
+                print("ERROR: Invalid TELEGRAM_TOKEN (Unauthorized). Check your TELEGRAM_TOKEN environment variable.", file=sys.stderr)
+                sys.exit(1)
+            try:
+                bot.remove_webhook()
+                print("Attempted to remove webhook after ApiTelegramException.")
+            except Exception:
+                pass
+            print(f"Sleeping for {retry_delay}s before retrying polling...", file=sys.stderr)
+            time.sleep(retry_delay)
+            retry_delay = min(max_delay, int(retry_delay * 2))
+            continue
+        except Exception as e:
+            print(f"Exception in polling: {e}", file=sys.stderr)
+            try:
+                bot.remove_webhook()
+            except Exception:
+                pass
+            print(f"Sleeping for {retry_delay}s before retrying polling...", file=sys.stderr)
+            time.sleep(retry_delay)
+            retry_delay = min(max_delay, int(retry_delay * 2))
+            continue
+        else:
+            print("Polling ended normally, restarting in 2s...")
+            time.sleep(2)
+            retry_delay = 2
