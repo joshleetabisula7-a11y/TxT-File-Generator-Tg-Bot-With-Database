@@ -4,6 +4,8 @@ import random
 import threading
 import tempfile
 import hashlib
+import uuid
+import html
 from datetime import datetime, timedelta
 
 import psycopg2
@@ -18,6 +20,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "7011151235"))
 
 LOG_FILE = "logs.txt"
 SEARCH_LINE_LIMIT = 200  # <-- per-search limit
+SEARCH_COOLDOWN_MINUTES = 5  # per-user cooldown in minutes
 
 if not TOKEN or not DATABASE_URL:
     raise Exception("Missing TELEGRAM_TOKEN or DATABASE_URL")
@@ -55,6 +58,14 @@ def load_logs():
 logs = load_logs()
 sent = {}  # mapping: keyword -> set(lines already sent for this kw)
 
+# ================= COOLDOWN (in-memory) =================
+# mapping: user_id -> datetime of last search
+last_search = {}
+
+# ================= FEEDBACK STORAGE (in-memory) =================
+# feedback_id -> {user_id, user_name, file_id, caption, status, created_at, admin_msg_chat, admin_msg_id}
+feedbacks = {}
+
 # ================= UTIL: KEY CHECK =================
 def get_user_expiry(user_id):
     cursor.execute("SELECT expires FROM users WHERE user_id=%s", (user_id,))
@@ -71,6 +82,28 @@ def has_active_key(user_id):
     cursor.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
     conn.commit()
     return False
+
+# ================= UTIL: COOLDOWN HELPERS =================
+def is_on_cooldown(user_id):
+    """Return (on_cooldown:bool, remaining_timedelta:timedelta)"""
+    if user_id == ADMIN_ID:
+        return False, timedelta(0)  # admin bypass
+    last = last_search.get(user_id)
+    if not last:
+        return False, timedelta(0)
+    expire_time = last + timedelta(minutes=SEARCH_COOLDOWN_MINUTES)
+    now = datetime.now()
+    if now < expire_time:
+        return True, (expire_time - now)
+    return False, timedelta(0)
+
+def set_search_timestamp(user_id):
+    last_search[user_id] = datetime.now()
+
+def fmt_timedelta(td):
+    total = int(td.total_seconds())
+    mins, secs = divmod(total, 60)
+    return f"{mins}m {secs}s" if mins else f"{secs}s"
 
 # ================= UTIL: PROCESS REDEEM =================
 def process_redeem_for_user(uid, key):
@@ -173,7 +206,8 @@ def make_main_keyboard(is_admin=False):
         InlineKeyboardButton("📊 Account Status", callback_data="check_access"),
         InlineKeyboardButton("❓ Help", callback_data="help_cb"),
         InlineKeyboardButton("📞 Owner", url="https://t.me/OnlyJosh4"),
-        InlineKeyboardButton("🔄 Refresh Logs", callback_data="refresh_logs")
+        InlineKeyboardButton("🔄 Refresh Logs", callback_data="refresh_logs"),
+        InlineKeyboardButton("📝 Feedback", callback_data="feedback_prompt")
     )
     if is_admin:
         kb.add(InlineKeyboardButton("🛠️ Admin Panel", callback_data="admin_panel"))
@@ -193,11 +227,12 @@ def start(message):
         status_line = "❌ <b>No active key</b>\nUse the Redeem Key button or /redeem <KEY>"
 
     welcome = (
-        f"👋 <b>Hello, {name} {username}</b>\n\n"
+        f"👋 <b>Hello, {html.escape(name)} {html.escape(username)}</b>\n\n"
         f"{status_line}\n\n"
         "Welcome to <b>PaFreeTxtNiJosh</b> — search large logs quickly and safely.\n"
         "Use the buttons below to start searching, redeem a key, or see help.\n\n"
-        "<i>Tip:</i> If results are too long we send only the first 200 lines per search."
+        f"<i>Tip:</i> If results are too long we send only the first {SEARCH_LINE_LIMIT} lines per search.\n"
+        f"<i>Anti-spam:</i> There is a {SEARCH_COOLDOWN_MINUTES}-minute cooldown between searches per user."
     )
 
     bot.send_message(message.chat.id, welcome, parse_mode="HTML", reply_markup=make_main_keyboard(is_admin=is_admin))
@@ -205,9 +240,17 @@ def start(message):
 # ================= SEARCH FLOW =================
 @bot.callback_query_handler(func=lambda c: c.data == "search")
 def ask_search(call):
+    # check active key
     if not has_active_key(call.from_user.id):
         bot.answer_callback_query(call.id, "You need an active key to search (use Redeem).", show_alert=True)
         return
+
+    # cooldown check
+    on_cd, rem = is_on_cooldown(call.from_user.id)
+    if on_cd:
+        bot.answer_callback_query(call.id, f"Please wait {fmt_timedelta(rem)} before your next search.", show_alert=True)
+        return
+
     msg = bot.send_message(call.message.chat.id, "🔎 Please send the keyword to search for:")
     bot.register_next_step_handler(msg, do_search)
 
@@ -218,13 +261,23 @@ def safe_filename_for_kw(kw):
 def do_search(message):
     try:
         uid = message.from_user.id
+
+        # check active key before performing search
         if not has_active_key(uid):
             bot.send_message(message.chat.id, "❌ You need an active key to search.")
             return
+
+        # cooldown check again (in-case time passed between pressing button and sending message)
+        on_cd, rem = is_on_cooldown(uid)
+        if on_cd:
+            bot.send_message(message.chat.id, f"⏳ Cooldown active. Please wait {fmt_timedelta(rem)} before your next search.")
+            return
+
         kw = message.text.strip().lower()
         if not kw:
             bot.send_message(message.chat.id, "❌ Empty keyword.")
             return
+
         results = []
         seen = sent.get(kw, set())
         for line in logs:
@@ -247,6 +300,9 @@ def do_search(message):
         else:
             results_to_send = results
 
+        # mark last search timestamp (start of sending)
+        set_search_timestamp(uid)
+
         tmp_path = None
         try:
             tmp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, prefix="results_", suffix=".txt")
@@ -257,6 +313,7 @@ def do_search(message):
             caption = f"✅ Found {len(results)} lines"
             if truncated:
                 caption += f" — showing first {SEARCH_LINE_LIMIT} lines"
+            caption += f"\n⏱️ Next search available in {SEARCH_COOLDOWN_MINUTES} minutes."
             with open(tmp_path, "rb") as f:
                 bot.send_document(
                     message.chat.id,
@@ -276,20 +333,161 @@ def do_search(message):
         except Exception:
             pass
 
-# ================= REDEEM VIA BUTTON FLOW =================
-@bot.callback_query_handler(func=lambda c: c.data == "redeem_prompt")
-def redeem_prompt(call):
-    msg = bot.send_message(call.message.chat.id, "🔑 Please send your key (format: KEY-XXXXXX):")
-    bot.register_next_step_handler(msg, redeem_via_prompt)
+# ================= FEEDBACK FLOW =================
+@bot.callback_query_handler(func=lambda c: c.data == "feedback_prompt")
+def feedback_prompt(call):
+    msg = bot.send_message(call.message.chat.id, "📝 Please send a photo for feedback. Add a caption describing the feedback (optional).")
+    bot.register_next_step_handler(msg, feedback_receive_photo)
 
-def redeem_via_prompt(message):
+def feedback_receive_photo(message):
+    """
+    Expecting a photo message (with optional caption).
+    We'll forward the photo+caption to admin with approve/reject buttons.
+    """
     try:
-        key = message.text.strip()
+        if not message.photo:
+            bot.send_message(message.chat.id, "❌ No photo detected. Please press Feedback again and send a photo.")
+            return
+
+        # take the highest-resolution photo (last in list)
+        file_id = message.photo[-1].file_id
+        caption = message.caption or ""
         uid = message.from_user.id
-        ok, msg, _ = process_redeem_for_user(uid, key)
-        bot.send_message(message.chat.id, msg)
-    except Exception:
-        bot.send_message(message.chat.id, "Usage: send KEY-XXXXXX or use /redeem KEY-XXXXXX")
+        name = message.from_user.first_name or ""
+        username = ("@" + message.from_user.username) if message.from_user.username else "NoUsername"
+
+        # create feedback entry
+        fid = uuid.uuid4().hex[:10]
+        feedbacks[fid] = {
+            "user_id": uid,
+            "user_name": f"{name} {username}",
+            "file_id": file_id,
+            "caption": caption,
+            "status": "pending",
+            "created_at": datetime.now(),
+            "admin_msg_chat": None,
+            "admin_msg_id": None
+        }
+
+        # send to admin with approve/reject buttons
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("✅ Approve", callback_data=f"fb_approve:{fid}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"fb_reject:{fid}")
+        )
+
+        admin_caption = (
+            f"📥 New feedback (ID: {fid})\n"
+            f"From: <b>{html.escape(feedbacks[fid]['user_name'])}</b>\n\n"
+            f"{html.escape(caption) if caption else '<i>(no caption)</i>'}\n\n"
+            f"Sent: {feedbacks[fid]['created_at']}"
+        )
+
+        # send photo to admin; capture returned message id and chat id
+        sent_msg = bot.send_photo(ADMIN_ID, file_id, caption=admin_caption, parse_mode="HTML", reply_markup=kb)
+
+        # store admin message reference
+        feedbacks[fid]["admin_msg_chat"] = sent_msg.chat.id
+        feedbacks[fid]["admin_msg_id"] = sent_msg.message_id
+
+        bot.send_message(message.chat.id, "✅ Feedback sent to admin for review. You'll be notified when approved or rejected.")
+    except Exception as e:
+        bot.send_message(message.chat.id, "⚠️ Error sending feedback. Try again.")
+        try:
+            bot.send_message(ADMIN_ID, f"Feedback send error: {e}")
+        except Exception:
+            pass
+
+# ================= FEEDBACK APPROVAL CALLBACKS =================
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("fb_approve:"))
+def feedback_approve_cb(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Not authorized", show_alert=True)
+        return
+    try:
+        fid = call.data.split(":", 1)[1]
+        fb = feedbacks.get(fid)
+        if not fb:
+            bot.answer_callback_query(call.id, "Feedback not found or expired.", show_alert=True)
+            return
+        if fb["status"] != "pending":
+            bot.answer_callback_query(call.id, f"Already {fb['status']}.", show_alert=True)
+            return
+
+        fb["status"] = "approved"
+        fb["admin_decision_at"] = datetime.now()
+        fb["admin_decision_by"] = call.from_user.id
+
+        # edit admin message caption to show approved status
+        try:
+            new_caption = f"{call.message.caption}\n\n✅ <b>APPROVED</b> by admin ({call.from_user.id}) at {fb['admin_decision_at']}"
+            bot.edit_message_caption(chat_id=fb["admin_msg_chat"], message_id=fb["admin_msg_id"], caption=new_caption, parse_mode="HTML", reply_markup=None)
+        except Exception:
+            # fallback: edit reply markup only
+            try:
+                bot.edit_message_reply_markup(chat_id=fb["admin_msg_chat"], message_id=fb["admin_msg_id"], reply_markup=None)
+                bot.send_message(ADMIN_ID, f"✅ Feedback {fid} approved.")
+            except Exception:
+                pass
+
+        # notify the original user
+        try:
+            bot.send_message(fb["user_id"], f"✅ Your feedback (ID: {fid}) was approved by admin. Thank you!")
+        except Exception:
+            pass
+
+        bot.answer_callback_query(call.id, "Feedback approved.", show_alert=True)
+    except Exception as e:
+        bot.answer_callback_query(call.id, "Error processing approval.", show_alert=True)
+        try:
+            bot.send_message(ADMIN_ID, f"Error approving feedback {call.data}: {e}")
+        except Exception:
+            pass
+
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("fb_reject:"))
+def feedback_reject_cb(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "Not authorized", show_alert=True)
+        return
+    try:
+        fid = call.data.split(":", 1)[1]
+        fb = feedbacks.get(fid)
+        if not fb:
+            bot.answer_callback_query(call.id, "Feedback not found or expired.", show_alert=True)
+            return
+        if fb["status"] != "pending":
+            bot.answer_callback_query(call.id, f"Already {fb['status']}.", show_alert=True)
+            return
+
+        fb["status"] = "rejected"
+        fb["admin_decision_at"] = datetime.now()
+        fb["admin_decision_by"] = call.from_user.id
+
+        # edit admin message caption to show rejected status
+        try:
+            new_caption = f"{call.message.caption}\n\n❌ <b>REJECTED</b> by admin ({call.from_user.id}) at {fb['admin_decision_at']}"
+            bot.edit_message_caption(chat_id=fb["admin_msg_chat"], message_id=fb["admin_msg_id"], caption=new_caption, parse_mode="HTML", reply_markup=None)
+        except Exception:
+            # fallback: edit reply markup only
+            try:
+                bot.edit_message_reply_markup(chat_id=fb["admin_msg_chat"], message_id=fb["admin_msg_id"], reply_markup=None)
+                bot.send_message(ADMIN_ID, f"❌ Feedback {fid} rejected.")
+            except Exception:
+                pass
+
+        # notify the original user
+        try:
+            bot.send_message(fb["user_id"], f"❌ Your feedback (ID: {fid}) was rejected by admin.")
+        except Exception:
+            pass
+
+        bot.answer_callback_query(call.id, "Feedback rejected.", show_alert=True)
+    except Exception as e:
+        bot.answer_callback_query(call.id, "Error processing rejection.", show_alert=True)
+        try:
+            bot.send_message(ADMIN_ID, f"Error rejecting feedback {call.data}: {e}")
+        except Exception:
+            pass
 
 # ================= CHECK ACCESS CALLBACK =================
 @bot.callback_query_handler(func=lambda c: c.data == "check_access")
